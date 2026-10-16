@@ -12,14 +12,19 @@ import {
   LockKeyhole,
   RotateCcw,
   RefreshCw,
+  Info,
 } from "lucide-react";
 import type { Assessment } from "./types";
 import { isAssessment } from "./types";
 
 type Mode = "url" | "qr";
+type DecodeState = "idle" | "decoding" | "done" | "error";
 
 /** Max payload length — mirrors server-side Zod schema. */
 const MAX_PAYLOAD = 4096;
+const MAX_FILE_BYTES = 5 * 1024 * 1024; // 5 MB
+const MAX_PIXELS = 16_000_000; // 16 MP
+const ACCEPTED_TYPES = ["image/png", "image/jpeg", "image/webp"];
 
 export default function App() {
   const [mode, setMode] = useState<Mode>("url");
@@ -28,53 +33,114 @@ export default function App() {
   const [assessment, setAssessment] = useState<Assessment | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [decodeState, setDecodeState] = useState<DecodeState>("idle");
+  const [dragOver, setDragOver] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
   // AbortController ref lets us cancel an in-flight request on Reset.
   const abortRef = useRef<AbortController | null>(null);
 
-  // ── QR decode (runs entirely in-browser; image is never uploaded) ────────
-  async function decodeFile(file?: File) {
+  // ── QR decode (runs entirely in-browser; image is NEVER uploaded) ─────────
+  async function decodeFile(file?: File | null) {
     setError("");
     setAssessment(null);
     setPayload("");
     setFileName("");
+    setDecodeState("idle");
+
     if (!file) return;
-    if (!["image/png", "image/jpeg", "image/webp"].includes(file.type)) {
+
+    // Validate file type.
+    if (!ACCEPTED_TYPES.includes(file.type)) {
       setError("Choose a PNG, JPEG, or WebP image.");
+      setDecodeState("error");
       return;
     }
-    if (file.size > 5 * 1024 * 1024) {
+
+    // Validate file size.
+    if (file.size > MAX_FILE_BYTES) {
       setError("Image must be 5 MB or smaller.");
+      setDecodeState("error");
       return;
     }
+
+    setDecodeState("decoding");
+
     try {
       const bitmap = await createImageBitmap(file);
-      if (bitmap.width * bitmap.height > 16_000_000) {
+
+      // Validate pixel dimensions to avoid canvas memory exhaustion.
+      if (bitmap.width * bitmap.height > MAX_PIXELS) {
         bitmap.close();
-        setError("Image dimensions are too large to process safely.");
+        setError("Image dimensions are too large to process safely (max 16 MP).");
+        setDecodeState("error");
         return;
       }
+
       const canvas = document.createElement("canvas");
       canvas.width = bitmap.width;
       canvas.height = bitmap.height;
       const context = canvas.getContext("2d", { willReadFrequently: true });
-      if (!context) throw new Error("Could not initialize local image decoding.");
+      if (!context) {
+        bitmap.close();
+        throw new Error("Could not initialize local image decoding.");
+      }
       context.drawImage(bitmap, 0, 0);
       bitmap.close();
+
       const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
       const decoded = jsQR(imageData.data, imageData.width, imageData.height);
-      if (!decoded?.data) {
-        setError("No QR code found. Try a clearer image with the whole code visible.");
+
+      // jsQR returns null when no code is found, or an object with data="" for
+      // an empty code. Both are failures for our purposes.
+      if (!decoded || !decoded.data.trim()) {
+        setError(
+          "No QR code found in this image. Try a clearer photo with the whole code in frame."
+        );
+        setDecodeState("error");
         return;
       }
-      setPayload(decoded.data);
+
+      const decoded_text = decoded.data.trim();
+
+      if (decoded_text.length > MAX_PAYLOAD) {
+        setError(
+          `The decoded QR content is too long (${decoded_text.length} characters; maximum ${MAX_PAYLOAD}).`
+        );
+        setDecodeState("error");
+        return;
+      }
+
+      setPayload(decoded_text);
       setFileName(file.name);
+      setDecodeState("done");
     } catch {
-      setError("The image could not be decoded. Try a valid, non-corrupt image.");
+      setError("The image could not be decoded. Try a valid, non-corrupt image file.");
+      setDecodeState("error");
     }
   }
 
-  // ── Submit analysis ──────────────────────────────────────────────────────
+  // ── Drag-and-drop handlers ────────────────────────────────────────────────
+  function handleDragOver(e: React.DragEvent<HTMLDivElement>) {
+    e.preventDefault(); // Required to allow drop.
+    e.stopPropagation();
+    setDragOver(true);
+  }
+
+  function handleDragLeave(e: React.DragEvent<HTMLDivElement>) {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOver(false);
+  }
+
+  function handleDrop(e: React.DragEvent<HTMLDivElement>) {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOver(false);
+    const file = e.dataTransfer.files?.[0];
+    void decodeFile(file);
+  }
+
+  // ── Submit analysis ───────────────────────────────────────────────────────
   async function analyze() {
     setError("");
     setAssessment(null);
@@ -89,8 +155,7 @@ export default function App() {
       return;
     }
 
-    // Guard against duplicate submissions (button is also disabled while busy,
-    // but defend in the handler too).
+    // Guard against duplicate submissions (button is also disabled while busy).
     if (busy) return;
 
     const controller = new AbortController();
@@ -101,7 +166,8 @@ export default function App() {
       const response = await fetch("/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        // Payload is sent as a JSON string — the API key never touches the client.
+        // Only the decoded text string is sent — the image never leaves the browser.
+        // The API key never touches the client.
         body: JSON.stringify({ payload: value }),
         signal: controller.signal,
       });
@@ -138,7 +204,7 @@ export default function App() {
     }
   }
 
-  // ── Reset — also cancels any in-flight request ───────────────────────────
+  // ── Reset — also cancels any in-flight request ────────────────────────────
   function reset() {
     abortRef.current?.abort();
     abortRef.current = null;
@@ -147,6 +213,8 @@ export default function App() {
     setAssessment(null);
     setError("");
     setBusy(false);
+    setDecodeState("idle");
+    setDragOver(false);
     if (fileInput.current) fileInput.current.value = "";
   }
 
@@ -179,7 +247,7 @@ export default function App() {
       </section>
 
       <section className="workspace">
-        {/* ── Input panel ─────────────────────────────────────────────── */}
+        {/* ── Input panel ───────────────────────────────────────────────── */}
         <div className="panel input-panel">
           <div className="panel-heading">
             <div><span className="step">01</span><h2>Inspect a payload</h2></div>
@@ -209,6 +277,7 @@ export default function App() {
             </button>
           </div>
 
+          {/* ── URL / text mode ─────────────────────────────────────────── */}
           {mode === "url" ? (
             <label className="field-label" id="panel-url">
               URL or text payload
@@ -227,36 +296,74 @@ export default function App() {
               />
             </label>
           ) : (
-            <div className="upload-zone" id="panel-qr">
+            /* ── QR image mode ────────────────────────────────────────── */
+            <div
+              id="panel-qr"
+              className={`upload-zone${dragOver ? " drag-over" : ""}${decodeState === "decoding" ? " decoding" : ""}`}
+              // Drag-and-drop: events are wired here; the hidden <input> handles
+              // picker-selection only. No object URLs are created.
+              onDragOver={handleDragOver}
+              onDragLeave={handleDragLeave}
+              onDrop={handleDrop}
+              aria-label="QR image drop zone"
+            >
+              {/* Hidden input for file-picker — pointer-events:none keeps it
+                  from intercepting drags, which are handled on the parent div */}
               <input
                 ref={fileInput}
                 type="file"
                 accept="image/png,image/jpeg,image/webp"
                 aria-label="Upload QR code image"
                 onChange={(e) => void decodeFile(e.target.files?.[0])}
+                tabIndex={-1}
               />
-              <div className="upload-icon"><Upload size={22} /></div>
-              <strong>{fileName || "Choose a QR-code image"}</strong>
-              <span>PNG, JPEG or WebP · Up to 5 MB</span>
-              <button
-                className="secondary-button"
-                onClick={() => fileInput.current?.click()}
-              >
-                <Upload size={15} /> Select image
-              </button>
-              <p className="local-note">
-                <LockKeyhole size={13} /> Image is decoded in your browser and is not uploaded.
-              </p>
+
+              {decodeState === "decoding" ? (
+                /* ── Decoding in progress ──────────────────────────── */
+                <>
+                  <LoaderCircle className="spin" size={28} style={{ color: "var(--green)" }} />
+                  <strong>Decoding image locally…</strong>
+                  <span>Your image never leaves your browser.</span>
+                </>
+              ) : (
+                /* ── Idle / waiting for file ───────────────────────── */
+                <>
+                  <div className="upload-icon"><Upload size={22} /></div>
+                  <strong>{fileName || (dragOver ? "Drop to decode" : "Choose or drop a QR image")}</strong>
+                  <span>PNG, JPEG or WebP · up to 5 MB · decoded locally</span>
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    onClick={() => fileInput.current?.click()}
+                  >
+                    <Upload size={15} /> Select image
+                  </button>
+                  <p className="local-note">
+                    <LockKeyhole size={13} /> Image is decoded in your browser — it is not uploaded to the server.
+                  </p>
+                </>
+              )}
             </div>
           )}
 
-          {/* QR decoded preview — rendered as inert text, never as a link */}
-          {mode === "qr" && payload && (
+          {/* ── QR decoded text preview ──────────────────────────────────── */}
+          {/* Rendered as <code>, never as <a>. Decoding extracts text; it does
+              not verify the destination or prove the content is safe. */}
+          {mode === "qr" && decodeState === "done" && payload && (
             <div className="decoded-box">
-              <div className="decoded-title"><CheckCircle2 size={15} /> Decoded locally (inert text)</div>
-              {/* Rendered as <code>, not as <a> — URL is never auto-opened */}
+              <div className="decoded-title">
+                <CheckCircle2 size={15} /> Decoded locally — inert text only
+              </div>
+              {/* Plain text render — no href, no auto-open, no link. */}
               <code>{payload}</code>
-              <button className="text-button" onClick={() => setMode("url")}>Edit payload</button>
+              <div className="decoded-safety-note">
+                <Info size={12} />
+                Decoding extracts the text content only. It does not confirm the
+                destination is safe. Submit for AI analysis below.
+              </div>
+              <button className="text-button" onClick={() => setMode("url")}>
+                Edit payload
+              </button>
             </div>
           )}
 
@@ -272,7 +379,7 @@ export default function App() {
             <div className="error-message" role="alert" aria-live="assertive">
               <AlertTriangle size={16} />
               <span className="error-text">{error}</span>
-              {/* Only show retry when there is a payload to re-submit */}
+              {/* Show retry only when there is an analysable payload */}
               {payload.trim() && !busy && (
                 <button
                   className="text-button retry-button"
@@ -299,12 +406,12 @@ export default function App() {
           </button>
 
           <p className="microcopy">
-            Only the decoded text is sent to the AI API. Your image stays in your browser.
-            No scan history is saved by this app.
+            Only the decoded text is sent to the AI API for analysis.
+            Your image stays in your browser. No scan history is saved.
           </p>
         </div>
 
-        {/* ── Results panel ────────────────────────────────────────────── */}
+        {/* ── Results panel ──────────────────────────────────────────────── */}
         <div className="panel results-panel" aria-live="polite" aria-atomic="true">
           <div className="panel-heading">
             <div><span className="step">02</span><h2>Risk assessment</h2></div>
@@ -349,11 +456,11 @@ export default function App() {
               {/* Payload type */}
               <div className="result-section">
                 <h3>Payload type</h3>
-                {/* payloadType is plain text — rendered safely as text content */}
+                {/* payloadType is plain text — React renders as text content, not HTML */}
                 <p>{assessment.payloadType}</p>
               </div>
 
-              {/* Deterministic observations — structural, no AI interpretation */}
+              {/* Deterministic observations — structural only, no AI interpretation */}
               <div className="result-section">
                 <h3>
                   Observed indicators
@@ -362,7 +469,7 @@ export default function App() {
                 {assessment.deterministicObservations.length ? (
                   <ul>
                     {assessment.deterministicObservations.map((item, i) => (
-                      // Items are plain strings from the server — React renders as text, not HTML.
+                      // Plain strings from server — React renders as text, not HTML.
                       <li key={i}>{item}</li>
                     ))}
                   </ul>
@@ -380,7 +487,7 @@ export default function App() {
                 {assessment.evidence.length ? (
                   <ul>
                     {assessment.evidence.map((item, i) => (
-                      // Evidence items are plain strings — never rendered as links or HTML.
+                      // Evidence items are plain strings — never rendered as links.
                       <li key={i}>{item}</li>
                     ))}
                   </ul>
