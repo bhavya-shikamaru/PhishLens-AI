@@ -1,647 +1,1066 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState, type ChangeEvent } from "react";
 import jsQR from "jsqr";
 import {
-  ShieldCheck,
+  Bell,
+  ChevronRight,
+  ChevronsUpDown,
+  CircleHelp,
+  Clock3,
+  FileImage,
+  History as HistoryIcon,
+  Image as ImageIcon,
+  LayoutDashboard,
+  Link as LinkIcon,
+  Lock,
+  LockKeyhole,
+  PanelLeftClose,
+  PanelLeftOpen,
+  QrCode,
+  RotateCcw,
   ScanLine,
-  Link2,
-  Upload,
-  ArrowRight,
+  ScanSearch,
+  ShieldAlert,
+  ShieldCheck,
+  SlidersHorizontal,
+  Sparkles,
+  X,
+  LoaderCircle,
   AlertTriangle,
   CheckCircle2,
-  LoaderCircle,
-  LockKeyhole,
-  RotateCcw,
-  RefreshCw,
-  Info,
-  Camera,
 } from "lucide-react";
-import type { Assessment } from "./types";
+import type { Assessment, Risk } from "./types";
 import { isAssessment } from "./types";
 
-type Mode = "url" | "qr" | "screenshot";
-type DecodeState = "idle" | "decoding" | "done" | "error";
+type InputMode = "URL / Text" | "QR image" | "Screenshot";
+type View = "Overview" | "Analyze" | "History" | "Threat intel" | "Preferences";
 
-/** Max payload length — mirrors server-side Zod schema. */
+interface HistoryEntry {
+  id: string;
+  label: string;
+  mode: InputMode;
+  risk?: Risk;
+  createdAt: number;
+}
+
+const PRIMARY_NAV: Array<[Exclude<View, "Preferences">, typeof LayoutDashboard]> = [
+  ["Overview", LayoutDashboard],
+  ["Analyze", ScanLine],
+  ["History", HistoryIcon],
+  ["Threat intel", ShieldAlert],
+];
+
 const MAX_PAYLOAD = 4096;
-const MAX_FILE_BYTES = 5 * 1024 * 1024; // 5 MB (QR decode)
-const MAX_SCREENSHOT_BYTES = 2 * 1024 * 1024; // 2 MB (server limit for screenshots)
-const MAX_PIXELS = 16_000_000; // 16 MP
+const MAX_QR_BYTES = 5 * 1024 * 1024; // 5 MB
+const MAX_SCREENSHOT_BYTES = 2 * 1024 * 1024; // 2 MB
+const MAX_PIXELS = 16_000_000;
 const ACCEPTED_TYPES = ["image/png", "image/jpeg", "image/webp"];
 
+function readHistory(): HistoryEntry[] {
+  try {
+    return JSON.parse(localStorage.getItem("phishlens-history") ?? "[]") as HistoryEntry[];
+  } catch {
+    return [];
+  }
+}
+
 export default function App() {
-  const [mode, setMode] = useState<Mode>("url");
+  const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth > 900);
+  const [activeView, setActiveView] = useState<View>("Analyze");
+  const [mode, setMode] = useState<InputMode>("URL / Text");
   const [payload, setPayload] = useState("");
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [fileName, setFileName] = useState("");
-  const [assessment, setAssessment] = useState<Assessment | null>(null);
-  const [error, setError] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [decodeState, setDecodeState] = useState<DecodeState>("idle");
   const [dragOver, setDragOver] = useState(false);
-  // Screenshot state
-  const [screenshotFile, setScreenshotFile] = useState<File | null>(null);
-  const [screenshotName, setScreenshotName] = useState("");
-  const fileInput = useRef<HTMLInputElement>(null);
-  const screenshotInput = useRef<HTMLInputElement>(null);
-  // AbortController ref lets us cancel an in-flight request on Reset.
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [assessment, setAssessment] = useState<Assessment | null>(null);
+  const [history, setHistory] = useState<HistoryEntry[]>(readHistory);
+
+  // Preference states
+  const [compact, setCompact] = useState(false);
+  const [saveLocalHistory, setSaveLocalHistory] = useState(true);
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
 
-  // ── QR decode (runs entirely in-browser; image is NEVER uploaded) ─────────
-  async function decodeFile(file?: File | null) {
+  useEffect(() => {
+    if (saveLocalHistory) {
+      localStorage.setItem("phishlens-history", JSON.stringify(history));
+    }
+  }, [history, saveLocalHistory]);
+
+  useEffect(() => {
+    const compactLayout = window.matchMedia("(max-width: 900px)");
+    const closeForCompact = () => {
+      if (compactLayout.matches) setSidebarOpen(false);
+    };
+    closeForCompact();
+    compactLayout.addEventListener("change", closeForCompact);
+    return () => compactLayout.removeEventListener("change", closeForCompact);
+  }, []);
+
+  useEffect(() => {
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setSidebarOpen(false);
+    };
+    window.addEventListener("keydown", handleKey);
+    return () => window.removeEventListener("keydown", handleKey);
+  }, []);
+
+  function chooseView(view: View) {
+    setActiveView(view);
+    if (window.innerWidth <= 900) setSidebarOpen(false);
+  }
+
+  function resetInput() {
+    if (abortRef.current) {
+      abortRef.current.abort();
+      abortRef.current = null;
+    }
+    setPayload("");
+    setSelectedFile(null);
+    setFileName("");
+    setError("");
+    setAssessment(null);
+    setBusy(false);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  }
+
+  function switchMode(newMode: InputMode) {
+    resetInput();
+    setMode(newMode);
+  }
+
+  // Local in-browser QR decoding
+  async function decodeQR(file: File) {
     setError("");
     setAssessment(null);
     setPayload("");
-    setFileName("");
-    setDecodeState("idle");
+    setFileName(file.name);
 
-    if (!file) return;
-
-    // Validate file type.
     if (!ACCEPTED_TYPES.includes(file.type)) {
-      setError("Choose a PNG, JPEG, or WebP image.");
-      setDecodeState("error");
+      setError("Please choose a PNG, JPEG, or WebP image.");
       return;
     }
-
-    // Validate file size.
-    if (file.size > MAX_FILE_BYTES) {
-      setError("Image must be 5 MB or smaller.");
-      setDecodeState("error");
+    if (file.size > MAX_QR_BYTES) {
+      setError("QR image must be 5 MB or smaller.");
       return;
     }
-
-    setDecodeState("decoding");
 
     try {
       const bitmap = await createImageBitmap(file);
-
-      // Validate pixel dimensions to avoid canvas memory exhaustion.
       if (bitmap.width * bitmap.height > MAX_PIXELS) {
         bitmap.close();
         setError("Image dimensions are too large to process safely (max 16 MP).");
-        setDecodeState("error");
         return;
       }
 
       const canvas = document.createElement("canvas");
       canvas.width = bitmap.width;
       canvas.height = bitmap.height;
-      const context = canvas.getContext("2d", { willReadFrequently: true });
-      if (!context) {
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      if (!ctx) {
         bitmap.close();
         throw new Error("Could not initialize local image decoding.");
       }
-      context.drawImage(bitmap, 0, 0);
+      ctx.drawImage(bitmap, 0, 0);
       bitmap.close();
 
-      const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
-      const decoded = jsQR(imageData.data, imageData.width, imageData.height);
+      const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const decoded = jsQR(imgData.data, imgData.width, imgData.height);
 
-      // jsQR returns null when no code is found, or an object with data="" for
-      // an empty code. Both are failures for our purposes.
       if (!decoded || !decoded.data.trim()) {
-        setError(
-          "No QR code found in this image. Try a clearer photo with the whole code in frame."
-        );
-        setDecodeState("error");
+        setError("No QR code found in this image. Try a clearer photo with the whole code in frame.");
         return;
       }
 
-      const decoded_text = decoded.data.trim();
-
-      if (decoded_text.length > MAX_PAYLOAD) {
-        setError(
-          `The decoded QR content is too long (${decoded_text.length} characters; maximum ${MAX_PAYLOAD}).`
-        );
-        setDecodeState("error");
+      const text = decoded.data.trim();
+      if (text.length > MAX_PAYLOAD) {
+        setError(`Decoded QR content is too long (${text.length} characters; max ${MAX_PAYLOAD}).`);
         return;
       }
 
-      setPayload(decoded_text);
-      setFileName(file.name);
-      setDecodeState("done");
+      setPayload(text);
     } catch {
       setError("The image could not be decoded. Try a valid, non-corrupt image file.");
-      setDecodeState("error");
     }
   }
 
-  // ── Drag-and-drop handlers ────────────────────────────────────────────────
-  function handleDragOver(e: React.DragEvent<HTMLDivElement>) {
-    e.preventDefault(); // Required to allow drop.
-    e.stopPropagation();
-    setDragOver(true);
+  function handleFileSelect(e: ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0] ?? null;
+    if (!file) return;
+    setSelectedFile(file);
+    if (mode === "QR image") {
+      void decodeQR(file);
+    } else {
+      setError("");
+      setAssessment(null);
+      setFileName(file.name);
+    }
   }
 
-  function handleDragLeave(e: React.DragEvent<HTMLDivElement>) {
-    e.preventDefault();
-    e.stopPropagation();
-    setDragOver(false);
+  function recordHistory(entryLabel: string, entryRisk?: Risk) {
+    if (!saveLocalHistory) return;
+    const item: HistoryEntry = {
+      id: crypto.randomUUID(),
+      label: entryLabel,
+      mode,
+      risk: entryRisk,
+      createdAt: Date.now(),
+    };
+    setHistory((prev) => [item, ...prev].slice(0, 20));
   }
 
-  function handleDrop(e: React.DragEvent<HTMLDivElement>) {
-    e.preventDefault();
-    e.stopPropagation();
-    setDragOver(false);
-    const file = e.dataTransfer.files?.[0];
-    void decodeFile(file);
-  }
-
-  // ── Submit analysis ───────────────────────────────────────────────────────
-  async function analyze() {
-    setError("");
-    setAssessment(null);
-
+  // Live URL / Text submission
+  async function submitText() {
     const value = payload.trim();
     if (!value) {
-      setError("Enter a URL or text payload, or upload a QR image first.");
+      setError(mode === "QR image" ? "Upload a readable QR code first." : "Enter a URL or text payload first.");
       return;
     }
     if (value.length > MAX_PAYLOAD) {
-      setError(`Payload is too long (maximum ${MAX_PAYLOAD.toLocaleString()} characters).`);
+      setError(`Payload must be ${MAX_PAYLOAD.toLocaleString()} characters or fewer.`);
       return;
     }
-
-    // Guard against duplicate submissions (button is also disabled while busy).
     if (busy) return;
+
+    setError("");
+    setAssessment(null);
+    setBusy(true);
 
     const controller = new AbortController();
     abortRef.current = controller;
-    setBusy(true);
 
     try {
-      const response = await fetch("/api/analyze", {
+      const res = await fetch("/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        // Only the decoded text string is sent — the image never leaves the browser.
-        // The API key never touches the client.
         body: JSON.stringify({ payload: value }),
         signal: controller.signal,
       });
 
-      const body: unknown = await response.json();
-
-      if (!response.ok) {
-        const message =
-          typeof body === "object" && body !== null && "error" in body
-            ? String((body as Record<string, unknown>).error)
-            : "Analysis failed. Please try again.";
-        throw new Error(message);
+      const data: unknown = await res.json();
+      if (!res.ok) {
+        const msg = typeof data === "object" && data !== null && "error" in data
+          ? String((data as Record<string, unknown>).error)
+          : "Analysis request failed.";
+        throw new Error(msg);
       }
 
-      // Validate the response shape before trusting it.
-      if (!isAssessment(body)) {
-        throw new Error(
-          "The server returned an unexpected response format. Please try again."
-        );
+      if (!isAssessment(data)) {
+        throw new Error("Received an unexpected response shape from the server.");
       }
 
-      setAssessment(body);
-    } catch (e) {
-      // Ignore abort errors — user deliberately cancelled via Reset.
-      if (e instanceof DOMException && e.name === "AbortError") return;
-      setError(
-        e instanceof Error
-          ? e.message
-          : "Could not connect to the analysis server. Check your connection and try again."
-      );
+      setAssessment(data);
+      recordHistory(value, data.risk);
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      setError(err instanceof Error ? err.message : "Failed to connect to the analysis service.");
     } finally {
       abortRef.current = null;
       setBusy(false);
     }
   }
 
-  // ── Submit screenshot to image analysis endpoint ──────────────────────
-  async function analyzeScreenshot() {
-    setError("");
-    setAssessment(null);
-
-    if (!screenshotFile) {
-      setError("Select a screenshot image first.");
+  // Live Screenshot submission
+  async function submitScreenshot() {
+    if (!selectedFile) {
+      setError("Please choose a screenshot image first.");
       return;
     }
-    if (screenshotFile.size > MAX_SCREENSHOT_BYTES) {
+    if (selectedFile.size > MAX_SCREENSHOT_BYTES) {
       setError("Screenshot must be 2 MB or smaller.");
       return;
     }
-    if (!ACCEPTED_TYPES.includes(screenshotFile.type)) {
+    if (!ACCEPTED_TYPES.includes(selectedFile.type)) {
       setError("Choose a PNG, JPEG, or WebP screenshot.");
       return;
     }
     if (busy) return;
 
-    const controller = new AbortController();
-    abortRef.current = controller;
+    setError("");
+    setAssessment(null);
     setBusy(true);
 
-    try {
-      // Image is sent as multipart FormData — the server receives raw bytes.
-      // The API key is never exposed to the client.
-      const form = new FormData();
-      form.append("image", screenshotFile);
+    const controller = new AbortController();
+    abortRef.current = controller;
 
-      const response = await fetch("/api/analyze/image", {
+    try {
+      const form = new FormData();
+      form.append("image", selectedFile);
+
+      const res = await fetch("/api/analyze/image", {
         method: "POST",
         body: form,
         signal: controller.signal,
-        // Do NOT set Content-Type — browser sets it with the correct boundary.
       });
 
-      const body: unknown = await response.json();
-
-      if (!response.ok) {
-        const message =
-          typeof body === "object" && body !== null && "error" in body
-            ? String((body as Record<string, unknown>).error)
-            : "Image analysis failed. Please try again.";
-        throw new Error(message);
+      const data: unknown = await res.json();
+      if (!res.ok) {
+        const msg = typeof data === "object" && data !== null && "error" in data
+          ? String((data as Record<string, unknown>).error)
+          : "Image analysis failed.";
+        throw new Error(msg);
       }
 
-      if (!isAssessment(body)) {
-        throw new Error(
-          "The server returned an unexpected response format. Please try again."
-        );
+      if (!isAssessment(data)) {
+        throw new Error("Received an unexpected response format from the server.");
       }
 
-      setAssessment(body);
-    } catch (e) {
-      if (e instanceof DOMException && e.name === "AbortError") return;
-      setError(
-        e instanceof Error
-          ? e.message
-          : "Could not connect to the analysis server. Check your connection and try again."
-      );
+      setAssessment(data);
+      recordHistory(selectedFile.name, data.risk);
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      setError(err instanceof Error ? err.message : "Failed to connect to image analysis server.");
     } finally {
       abortRef.current = null;
       setBusy(false);
     }
   }
 
-
-  // ── Reset — also cancels any in-flight request ────────────────────────────
-  function reset() {
-    abortRef.current?.abort();
-    abortRef.current = null;
-    setPayload("");
-    setFileName("");
-    setAssessment(null);
-    setError("");
-    setBusy(false);
-    setDecodeState("idle");
-    setDragOver(false);
-    setScreenshotFile(null);
-    setScreenshotName("");
-    if (fileInput.current) fileInput.current.value = "";
-    if (screenshotInput.current) screenshotInput.current.value = "";
+  function handleSubmit() {
+    if (mode === "Screenshot") {
+      void submitScreenshot();
+    } else {
+      void submitText();
+    }
   }
 
-  const riskClass = assessment?.risk.toLowerCase() ?? "";
-
   return (
-    <main className="shell">
-      <header className="topbar">
-        {/* href="#" is intentional; rel guards against any future navigation */}
-        <a
-          className="brand"
-          href="#"
-          rel="noreferrer noopener"
-          onClick={(e) => e.preventDefault()}
-          aria-label="PhishLens AI home"
-        >
-          <span className="brand-mark"><ShieldCheck size={23} /></span>
-          <span>PhishLens<span className="brand-ai"> AI</span></span>
-        </a>
-        <span className="privacy-pill"><LockKeyhole size={13} /> Private by default</span>
-      </header>
+    <div className={`app-shell ${sidebarOpen ? "" : "sidebar-is-closed"}`}>
+      {/* Sidebar */}
+      <aside className="sidebar" aria-label="Primary navigation" aria-hidden={!sidebarOpen}>
+        <button className="brand" type="button" onClick={() => chooseView("Overview")}>
+          <span className="brand-mark">
+            <ScanSearch size={16} />
+          </span>
+          <span>PhishLens <b>AI</b></span>
+        </button>
 
-      <section className="hero">
-        <div className="eyebrow"><span className="pulse" /> QR &amp; URL SECURITY ANALYSIS</div>
-        <h1>Look closer.<br /><span>Click safer.</span></h1>
-        <p className="hero-copy">
-          Inspect suspicious links before you trust them. Decode QR images locally,
-          then ask AI to explain the warning signs.
-        </p>
+        <button
+          className="mobile-sidebar-close"
+          type="button"
+          aria-label="Close sidebar"
+          onClick={() => setSidebarOpen(false)}
+        >
+          <X size={16} />
+        </button>
+
+        <div className="sidebar-label">Workspace</div>
+        <nav>
+          {PRIMARY_NAV.map(([name, Icon]) => (
+            <button
+              key={name}
+              className={`nav-item ${activeView === name ? "active" : ""}`}
+              type="button"
+              onClick={() => chooseView(name)}
+            >
+              <Icon size={16} />
+              {name}
+            </button>
+          ))}
+        </nav>
+
+        <div className="sidebar-label extra">System</div>
+        <nav>
+          <button
+            className={`nav-item ${activeView === "Preferences" ? "active" : ""}`}
+            type="button"
+            onClick={() => chooseView("Preferences")}
+          >
+            <SlidersHorizontal size={16} />
+            Preferences
+          </button>
+        </nav>
+
+        <div className="profile">
+          <span className="avatar">PL</span>
+          <span>Security Analyst</span>
+          <ChevronsUpDown size={13} />
+        </div>
+      </aside>
+
+      {sidebarOpen && (
+        <button
+          className="sidebar-scrim"
+          type="button"
+          aria-label="Close sidebar"
+          onClick={() => setSidebarOpen(false)}
+        />
+      )}
+
+      {/* Main Content Area */}
+      <main className="main">
+        {/* Top Header */}
+        <header className="topbar">
+          <div className="breadcrumb">
+            <button
+              className="icon-button"
+              type="button"
+              aria-label={sidebarOpen ? "Close sidebar" : "Open sidebar"}
+              onClick={() => setSidebarOpen((v) => !v)}
+            >
+              {sidebarOpen ? <PanelLeftClose size={16} /> : <PanelLeftOpen size={16} />}
+            </button>
+            <strong>Security workspace</strong>
+            <ChevronRight size={13} />
+            <span>{activeView}</span>
+          </div>
+
+          <div className="top-actions">
+            <button className="icon-button" type="button" aria-label="Notifications">
+              <Bell size={15} />
+            </button>
+            <button className="icon-button" type="button" aria-label="Help">
+              <CircleHelp size={15} />
+            </button>
+          </div>
+        </header>
+
+        {/* View Pages */}
+        <div className="page">
+          {activeView === "Analyze" && (
+            <AnalyzeView
+              mode={mode}
+              payload={payload}
+              selectedFile={selectedFile}
+              fileName={fileName}
+              dragOver={dragOver}
+              busy={busy}
+              error={error}
+              assessment={assessment}
+              fileInputRef={fileInputRef}
+              onSwitchMode={switchMode}
+              onPayloadChange={setPayload}
+              onFileSelect={handleFileSelect}
+              onDragOver={(e) => {
+                e.preventDefault();
+                setDragOver(true);
+              }}
+              onDragLeave={(e) => {
+                e.preventDefault();
+                setDragOver(false);
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                setDragOver(false);
+                const file = e.dataTransfer.files?.[0];
+                if (file) {
+                  setSelectedFile(file);
+                  if (mode === "QR image") void decodeQR(file);
+                  else setFileName(file.name);
+                }
+              }}
+              onReset={resetInput}
+              onSubmit={handleSubmit}
+            />
+          )}
+
+          {activeView === "Overview" && (
+            <OverviewView
+              history={history}
+              onAnalyze={() => chooseView("Analyze")}
+            />
+          )}
+
+          {activeView === "History" && (
+            <HistoryView
+              history={history}
+              onClear={() => setHistory([])}
+            />
+          )}
+
+          {activeView === "Threat intel" && <ThreatIntelView />}
+
+          {activeView === "Preferences" && (
+            <PreferencesView
+              compact={compact}
+              saveLocalHistory={saveLocalHistory}
+              onToggleCompact={setCompact}
+              onToggleSaveHistory={setSaveLocalHistory}
+            />
+          )}
+        </div>
+      </main>
+    </div>
+  );
+}
+
+// ── View 1: Analyze View ──────────────────────────────────────────────────────
+interface AnalyzeViewProps {
+  mode: InputMode;
+  payload: string;
+  selectedFile: File | null;
+  fileName: string;
+  dragOver: boolean;
+  busy: boolean;
+  error: string;
+  assessment: Assessment | null;
+  fileInputRef: React.RefObject<HTMLInputElement>;
+  onSwitchMode: (mode: InputMode) => void;
+  onPayloadChange: (val: string) => void;
+  onFileSelect: (e: ChangeEvent<HTMLInputElement>) => void;
+  onDragOver: (e: React.DragEvent) => void;
+  onDragLeave: (e: React.DragEvent) => void;
+  onDrop: (e: React.DragEvent) => void;
+  onReset: () => void;
+  onSubmit: () => void;
+}
+
+function AnalyzeView({
+  mode,
+  payload,
+  selectedFile,
+  fileName,
+  dragOver,
+  busy,
+  error,
+  assessment,
+  fileInputRef,
+  onSwitchMode,
+  onPayloadChange,
+  onFileSelect,
+  onDragOver,
+  onDragLeave,
+  onDrop,
+  onReset,
+  onSubmit,
+}: AnalyzeViewProps) {
+  return (
+    <>
+      <section className="intro">
+        <div className="eyebrow">
+          <Sparkles size={12} />
+          QR &amp; URL Security Analysis
+        </div>
+        <h1>
+          Inspect first.<br />
+          <em>Click safer.</em>
+        </h1>
+        <p>Assess suspicious links, text, and QR images before they earn your trust.</p>
       </section>
 
-      <section className="workspace">
-        {/* ── Input panel ───────────────────────────────────────────────── */}
-        <div className="panel input-panel">
-          <div className="panel-heading">
-            <div><span className="step">01</span><h2>Inspect a payload</h2></div>
-            <span className="tiny-label">NO LINK VISITS</span>
+      <section className="analysis-grid" aria-label="Link analysis">
+        {/* Step 01: Input Panel */}
+        <article className="panel">
+          <div className="panel-header">
+            <h2>
+              <span className="step">01</span>
+              Inspect a payload
+            </h2>
+            <span>Private scan</span>
           </div>
 
-          <div className="tabs" role="tablist" aria-label="Input type">
-            <button
-              className={mode === "url" ? "tab active" : "tab"}
-              onClick={() => { setMode("url"); setError(""); }}
-              role="tab"
-              aria-selected={mode === "url"}
-              id="tab-url"
-              aria-controls="panel-url"
-            >
-              <Link2 size={16} /> URL / Text
-            </button>
-            <button
-              className={mode === "qr" ? "tab active" : "tab"}
-              onClick={() => { setMode("qr"); setError(""); }}
-              role="tab"
-              aria-selected={mode === "qr"}
-              id="tab-qr"
-              aria-controls="panel-qr"
-            >
-              <ScanLine size={16} /> QR Image
-            </button>
-            <button
-              className={mode === "screenshot" ? "tab active" : "tab"}
-              onClick={() => { setMode("screenshot"); setError(""); }}
-              role="tab"
-              aria-selected={mode === "screenshot"}
-              id="tab-screenshot"
-              aria-controls="panel-screenshot"
-            >
-              <Camera size={16} /> Screenshot
-            </button>
-          </div>
+          <div className="panel-content">
+            <div className="mode-tabs" aria-label="Payload type">
+              <button
+                className={mode === "URL / Text" ? "active" : ""}
+                type="button"
+                onClick={() => onSwitchMode("URL / Text")}
+              >
+                <LinkIcon size={14} />
+                URL / Text
+              </button>
+              <button
+                className={mode === "QR image" ? "active" : ""}
+                type="button"
+                onClick={() => onSwitchMode("QR image")}
+              >
+                <QrCode size={14} />
+                QR image
+              </button>
+              <button
+                className={mode === "Screenshot" ? "active" : ""}
+                type="button"
+                onClick={() => onSwitchMode("Screenshot")}
+              >
+                <ImageIcon size={14} />
+                Screenshot
+              </button>
+            </div>
 
-          {/* ── URL / text mode ──────────────────────────────────────────── */}
-          {mode === "url" && (
-            <label className="field-label" id="panel-url">
-              URL or text payload
-              <textarea
-                id="payload-input"
-                value={payload}
-                onChange={(e) => { setPayload(e.target.value); setAssessment(null); }}
-                placeholder="Paste a suspicious URL or text payload…"
-                rows={5}
-                maxLength={MAX_PAYLOAD}
-                aria-label="Payload to analyze"
-                // Never auto-link or auto-open — this is inert text input.
-                autoComplete="off"
-                autoCorrect="off"
-                spellCheck={false}
-              />
-            </label>
-          )}
-          {/* ── QR image mode ───────────────────────────────────────────── */}
-          {mode === "qr" && (
-            <div
-              id="panel-qr"
-              className={`upload-zone${dragOver ? " drag-over" : ""}${decodeState === "decoding" ? " decoding" : ""}`}
-              onDragOver={handleDragOver}
-              onDragLeave={handleDragLeave}
-              onDrop={handleDrop}
-              aria-label="QR image drop zone"
+            {mode === "URL / Text" && (
+              <>
+                <label htmlFor="payload">URL or text payload</label>
+                <textarea
+                  id="payload"
+                  maxLength={MAX_PAYLOAD}
+                  value={payload}
+                  onChange={(e) => onPayloadChange(e.target.value)}
+                  placeholder="Paste a suspicious URL, message, or email text..."
+                />
+                <div className="input-meta">
+                  <span>{payload.length.toLocaleString()} / {MAX_PAYLOAD.toLocaleString()} characters</span>
+                  <button type="button" onClick={onReset}>
+                    <RotateCcw size={11} style={{ marginRight: 4 }} />
+                    Reset
+                  </button>
+                </div>
+              </>
+            )}
+
+            {mode === "QR image" && (
+              <>
+                <label
+                  className={`dropzone ${dragOver ? "dragover" : ""}`}
+                  onDragOver={onDragOver}
+                  onDragLeave={onDragLeave}
+                  onDrop={onDrop}
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  <FileImage size={24} />
+                  <strong>{fileName ? fileName : "Choose or drag a QR code image"}</strong>
+                  <span>Supports PNG, JPEG, WebP (up to 5 MB) · Decoded locally in browser</span>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="image/png,image/jpeg,image/webp"
+                    onChange={onFileSelect}
+                  />
+                </label>
+
+                {payload && (
+                  <div className="decoded-box">
+                    <span className="decoded-title">
+                      <CheckCircle2 size={13} />
+                      Decoded content (inert text):
+                    </span>
+                    <code>{payload}</code>
+                  </div>
+                )}
+
+                <div className="input-meta">
+                  <span>{payload ? `${payload.length} characters extracted` : "No code loaded"}</span>
+                  <button type="button" onClick={onReset}>
+                    <RotateCcw size={11} style={{ marginRight: 4 }} />
+                    Reset
+                  </button>
+                </div>
+              </>
+            )}
+
+            {mode === "Screenshot" && (
+              <>
+                <label
+                  className={`dropzone ${dragOver ? "dragover" : ""}`}
+                  onDragOver={onDragOver}
+                  onDragLeave={onDragLeave}
+                  onDrop={onDrop}
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  <FileImage size={24} />
+                  <strong>{selectedFile ? selectedFile.name : "Choose a message or page screenshot"}</strong>
+                  <span>
+                    {selectedFile
+                      ? `${Math.ceil(selectedFile.size / 1024)} KB selected`
+                      : "Drag & drop, or browse from device (max 2 MB)"}
+                  </span>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="image/png,image/jpeg,image/webp"
+                    onChange={onFileSelect}
+                  />
+                </label>
+
+                <div className="input-meta">
+                  <span>{selectedFile ? "Ready for multimodal evaluation" : "No screenshot selected"}</span>
+                  <button type="button" onClick={onReset}>
+                    <RotateCcw size={11} style={{ marginRight: 4 }} />
+                    Reset
+                  </button>
+                </div>
+              </>
+            )}
+
+            {error && <p className="form-error" role="alert">{error}</p>}
+
+            <button
+              className="primary-action"
+              type="button"
+              disabled={busy || (mode !== "Screenshot" && !payload.trim()) || (mode === "Screenshot" && !selectedFile)}
+              onClick={onSubmit}
             >
-              <input
-                ref={fileInput}
-                type="file"
-                accept="image/png,image/jpeg,image/webp"
-                aria-label="Upload QR code image"
-                onChange={(e) => void decodeFile(e.target.files?.[0])}
-                tabIndex={-1}
-              />
-              {decodeState === "decoding" ? (
+              {busy ? (
                 <>
-                  <LoaderCircle className="spin" size={28} style={{ color: "var(--green)" }} />
-                  <strong>Decoding image locally…</strong>
-                  <span>Your image never leaves your browser.</span>
+                  <LoaderCircle size={15} className="spin" />
+                  Analyzing with Gemma 4...
                 </>
               ) : (
                 <>
-                  <div className="upload-icon"><Upload size={22} /></div>
-                  <strong>{fileName || (dragOver ? "Drop to decode" : "Choose or drop a QR image")}</strong>
-                  <span>PNG, JPEG or WebP · up to 5 MB · decoded locally</span>
-                  <button
-                    className="secondary-button"
-                    type="button"
-                    onClick={() => fileInput.current?.click()}
-                  >
-                    <Upload size={15} /> Select image
-                  </button>
-                  <p className="local-note">
-                    <LockKeyhole size={13} /> Image is decoded in your browser — it is not uploaded to the server.
-                  </p>
+                  Analyze payload <ChevronRight size={15} />
                 </>
               )}
-            </div>
-          )}
-
-          {/* ── Screenshot mode ──────────────────────────────────────────── */}
-          {mode === "screenshot" && (
-            <div id="panel-screenshot" className="upload-zone">
-              <input
-                ref={screenshotInput}
-                type="file"
-                accept="image/png,image/jpeg,image/webp"
-                aria-label="Upload screenshot image"
-                style={{ position: "absolute", inset: 0, width: "100%", height: "100%", opacity: 0, pointerEvents: "none" }}
-                onChange={(e) => {
-                  const f = e.target.files?.[0] ?? null;
-                  setScreenshotFile(f);
-                  setScreenshotName(f?.name ?? "");
-                  setAssessment(null);
-                  setError("");
-                }}
-                tabIndex={-1}
-              />
-              <div className="upload-icon"><Camera size={22} /></div>
-              <strong>{screenshotName || "Choose a screenshot image"}</strong>
-              <span>PNG, JPEG or WebP · up to 2 MB · sent to AI for analysis</span>
-              <button
-                className="secondary-button"
-                type="button"
-                onClick={() => screenshotInput.current?.click()}
-              >
-                <Upload size={15} /> Select screenshot
-              </button>
-              <p className="local-note">
-                <Info size={13} /> The image is sent to the server for AI analysis only. The API key stays server-side.
-              </p>
-            </div>
-          )}
-
-          {/* ── QR decoded text preview ──────────────────────────────────── */}
-          {/* Rendered as <code>, never as <a>. Decoding extracts text; it does
-              not verify the destination or prove the content is safe. */}
-          {mode === "qr" && decodeState === "done" && payload && (
-            <div className="decoded-box">
-              <div className="decoded-title">
-                <CheckCircle2 size={15} /> Decoded locally — inert text only
-              </div>
-              {/* Plain text render — no href, no auto-open, no link. */}
-              <code>{payload}</code>
-              <div className="decoded-safety-note">
-                <Info size={12} />
-                Decoding extracts the text content only. It does not confirm the
-                destination is safe. Submit for AI analysis below.
-              </div>
-              <button className="text-button" onClick={() => setMode("url")}>
-                Edit payload
-              </button>
-            </div>
-          )}
-
-          <div className="input-meta">
-            {mode === "screenshot"
-              ? <span>{screenshotName ? `Selected: ${screenshotName}` : "No file selected"}</span>
-              : <span>{payload.length}/{MAX_PAYLOAD.toLocaleString()} characters</span>
-            }
-            <button className="text-button" onClick={reset} aria-label="Reset form">
-              <RotateCcw size={13} /> Reset
             </button>
+
+            <p className="privacy">
+              <LockKeyhole size={13} />
+              {mode === "Screenshot"
+                ? "Image is analyzed in RAM only and never stored to disk."
+                : "Only decoded text is submitted. Destination links are never visited."}
+            </p>
+          </div>
+        </article>
+
+        {/* Step 02: Result Panel */}
+        <article className="panel result-panel">
+          <div className="panel-header">
+            <h2>
+              <span className="step">02</span>
+              Risk assessment
+            </h2>
+            <span>{assessment ? "Gemma 4 Verified" : "AI Assisted"}</span>
           </div>
 
-          {/* Error banner with retry shortcut */}
-          {error && (
-            <div className="error-message" role="alert" aria-live="assertive">
-              <AlertTriangle size={16} />
-              <span className="error-text">{error}</span>
-              {/* Retry: use the right handler for the active mode */}
-              {(mode !== "screenshot" ? payload.trim() : !!screenshotFile) && !busy && (
-                <button
-                  className="text-button retry-button"
-                  onClick={() => mode === "screenshot" ? void analyzeScreenshot() : void analyze()}
-                  aria-label="Retry analysis"
-                >
-                  <RefreshCw size={12} /> Try again
-                </button>
-              )}
+          {busy ? (
+            <div className="loading-state">
+              <LoaderCircle size={36} className="spin" />
+              <strong>Evaluating security indicators</strong>
+              <span>Gemma 4 (gemma-4-26b-a4b-it) · Multi-angle evaluation</span>
             </div>
-          )}
-
-          <button
-            id="analyze-button"
-            className="primary-button"
-            onClick={() => mode === "screenshot" ? void analyzeScreenshot() : void analyze()}
-            disabled={busy || (mode === "screenshot" ? !screenshotFile : !payload.trim())}
-            aria-busy={busy}
-          >
-            {busy
-              ? <><LoaderCircle className="spin" size={17} /> Analyzing…</>
-              : <>Analyze payload <ArrowRight size={17} /></>
-            }
-          </button>
-
-          <p className="microcopy">
-            Only the decoded text is sent to the AI API for analysis.
-            Your image stays in your browser. No scan history is saved.
-          </p>
-        </div>
-
-        {/* ── Results panel ──────────────────────────────────────────────── */}
-        <div className="panel results-panel" aria-live="polite" aria-atomic="true">
-          <div className="panel-heading">
-            <div><span className="step">02</span><h2>Risk assessment</h2></div>
-            <span className="tiny-label">GEMMA 4</span>
-          </div>
-
-          {!assessment && !busy && (
-            <div className="empty-state">
-              <div className="empty-art"><ShieldCheck size={42} strokeWidth={1.3} /></div>
-              <h3>Your results will appear here</h3>
-              <p>
-                Submit a URL or decode a QR image to get a cautious risk assessment,
-                evidence, and safer next steps.
-              </p>
-              <div className="empty-features">
-                <span><CheckCircle2 size={14} /> Evidence-led</span>
-                <span><LockKeyhole size={14} /> No auto-opening</span>
-              </div>
-            </div>
-          )}
-
-          {busy && (
-            <div className="loading-state" role="status">
-              <LoaderCircle className="spin" size={30} />
-              <strong>Reviewing visible indicators</strong>
-              <span>Never visiting the submitted URL</span>
-            </div>
-          )}
-
-          {assessment && (
-            <div className="result-content">
-              {/* Risk label */}
-              <div className={`risk-banner ${riskClass}`} role="status">
-                <div className="risk-icon"><ShieldCheck size={24} /></div>
-                <div>
-                  <span className="result-label">PRELIMINARY RISK</span>
-                  <strong>{assessment.risk}</strong>
+          ) : assessment ? (
+            <div className="result-scroll">
+              {/* Risk Badge */}
+              <div className={`risk-banner ${assessment.risk.toLowerCase()}`}>
+                <div className="risk-icon">
+                  {assessment.risk === "HIGH" ? (
+                    <AlertTriangle size={22} />
+                  ) : assessment.risk === "LOW" ? (
+                    <CheckCircle2 size={22} />
+                  ) : (
+                    <ShieldAlert size={22} />
+                  )}
                 </div>
-                <span className="ai-badge">AI-assisted</span>
+                <div className="risk-details">
+                  <span className="result-label">Assessed Risk</span>
+                  <strong>{assessment.risk}</strong>
+                  <span className="risk-type-tag">{assessment.payloadType}</span>
+                </div>
               </div>
 
-              {/* Payload type */}
-              <div className="result-section">
-                <h3>Payload type</h3>
-                {/* payloadType is plain text — React renders as text content, not HTML */}
-                <p>{assessment.payloadType}</p>
-              </div>
-
-              {/* Deterministic observations — structural only, no AI interpretation */}
-              <div className="result-section">
-                <h3>
-                  Observed indicators
-                  <span className="section-source"> · structural checks</span>
-                </h3>
-                {assessment.deterministicObservations.length ? (
-                  <ul>
-                    {assessment.deterministicObservations.map((item, i) => (
-                      // Plain strings from server — React renders as text, not HTML.
-                      <li key={i}>{item}</li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p>No obvious structural indicators found.</p>
-                )}
-              </div>
-
-              {/* AI-generated evidence — model interpretation, not verified facts */}
-              <div className="result-section">
-                <h3>
-                  AI assessment
-                  <span className="section-source"> · model interpretation</span>
-                </h3>
-                {assessment.evidence.length ? (
+              {/* Observed Evidence */}
+              {assessment.evidence.length > 0 && (
+                <div className="result-section">
+                  <h3>Observed Evidence</h3>
                   <ul>
                     {assessment.evidence.map((item, i) => (
-                      // Evidence items are plain strings — never rendered as links.
                       <li key={i}>{item}</li>
                     ))}
                   </ul>
-                ) : (
-                  <p>No specific indicators returned.</p>
-                )}
-              </div>
+                </div>
+              )}
 
-              {/* Uncertainty — what could not be confirmed */}
-              <div className="result-section uncertainty">
-                <h3>What we can't confirm</h3>
-                <p>{assessment.uncertainty}</p>
-              </div>
+              {/* Deterministic Observations */}
+              {assessment.deterministicObservations.length > 0 && (
+                <div className="result-section">
+                  <h3>Structural Observations</h3>
+                  <ul>
+                    {assessment.deterministicObservations.map((item, i) => (
+                      <li key={i}>{item}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
 
-              {/* Recommended actions */}
-              <div className="result-section action-section">
-                <h3>Safer next steps</h3>
-                <ul>
-                  {assessment.recommendedAction.map((item, i) => (
-                    <li key={i}>{item}</li>
-                  ))}
-                </ul>
-              </div>
+              {/* Uncertainty */}
+              {assessment.uncertainty && (
+                <div className="result-section">
+                  <h3>Uncertainty &amp; Unknowns</h3>
+                  <p>{assessment.uncertainty}</p>
+                </div>
+              )}
 
-              {/* Disclaimer — always visible, always prominent */}
-              <p className="disclaimer" role="note">
-                {assessment.disclaimer}
+              {/* Recommended Actions */}
+              {assessment.recommendedAction.length > 0 && (
+                <div className="result-section">
+                  <h3>Recommended Safe Actions</h3>
+                  <ul>
+                    {assessment.recommendedAction.map((action, i) => (
+                      <li key={i}>{action}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {/* Disclaimer */}
+              <div className="disclaimer-box">
+                <strong>Safety Disclaimer:</strong> {assessment.disclaimer}
+              </div>
+            </div>
+          ) : (
+            <div className="empty-result">
+              <div className="shield">
+                <ShieldCheck size={32} />
+              </div>
+              <h2>Your results will appear here</h2>
+              <p>
+                Submit a link, text message, QR image, or screenshot to receive a structured risk breakdown and safe next steps.
               </p>
+              <div className="assurances">
+                <span><ShieldCheck size={12} /> Evidence-led</span>
+                <span><Lock size={12} /> No auto-opening</span>
+                <span><CheckCircle2 size={12} /> Local QR decode</span>
+              </div>
             </div>
           )}
-        </div>
+
+          <div className="result-note">
+            <b>Protection note:</b> links are never opened or fetched during inspection.
+          </div>
+        </article>
       </section>
 
       <footer>
-        <span>PhishLens AI <span className="footer-dot">·</span> Hack Day MVP</span>
-        <span>Inspect, don't assume.</span>
+        <span>PHISHLENS AI · SECURITY WORKSPACE</span>
+        <span>POWERED BY GEMMA 4 · ZERO-DESTINATION INSPECTION</span>
       </footer>
-    </main>
+    </>
+  );
+}
+
+// ── View 2: Overview View ─────────────────────────────────────────────────────
+function OverviewView({
+  history,
+  onAnalyze,
+}: {
+  history: HistoryEntry[];
+  onAnalyze: () => void;
+}) {
+  return (
+    <>
+      <section className="view-heading">
+        <div>
+          <span className="eyebrow left">
+            <Sparkles size={12} />
+            Workspace Overview
+          </span>
+          <h1>Security at a glance.</h1>
+          <p>Everything inspected in this browser session is tracked locally.</p>
+        </div>
+        <button className="secondary-action" type="button" onClick={onAnalyze}>
+          Analyze a payload <ChevronRight size={15} />
+        </button>
+      </section>
+
+      <section className="metric-grid">
+        <article className="metric">
+          <span>Prepared checks</span>
+          <strong>{history.length}</strong>
+          <small>In local session history</small>
+        </article>
+        <article className="metric">
+          <span>Supported channels</span>
+          <strong>3</strong>
+          <small>URL/Text, QR Code, Screenshot</small>
+        </article>
+        <article className="metric">
+          <span>Auto-opening</span>
+          <strong>Off</strong>
+          <small>By security design</small>
+        </article>
+      </section>
+
+      <section className="panel">
+        <div className="panel-header">
+          <h2>Recent Activity</h2>
+          <span>{history.length} Item{history.length === 1 ? "" : "s"}</span>
+        </div>
+        <div className="history-rows">
+          {history.length === 0 ? (
+            <p className="empty-copy">No payloads prepared yet in this session.</p>
+          ) : (
+            history.slice(0, 6).map((item) => (
+              <div className="history-row" key={item.id}>
+                <span className="history-icon">
+                  {item.mode === "URL / Text" ? (
+                    <LinkIcon size={15} />
+                  ) : item.mode === "QR image" ? (
+                    <QrCode size={15} />
+                  ) : (
+                    <FileImage size={15} />
+                  )}
+                </span>
+                <div>
+                  <strong>{item.label}</strong>
+                  <span>
+                    {item.mode} · {new Date(item.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                  </span>
+                </div>
+                {item.risk && (
+                  <span className={`local-tag ${item.risk.toLowerCase()}`}>
+                    {item.risk}
+                  </span>
+                )}
+              </div>
+            ))
+          )}
+        </div>
+      </section>
+    </>
+  );
+}
+
+// ── View 3: History View ──────────────────────────────────────────────────────
+function HistoryView({
+  history,
+  onClear,
+}: {
+  history: HistoryEntry[];
+  onClear: () => void;
+}) {
+  return (
+    <>
+      <section className="view-heading">
+        <div>
+          <span className="eyebrow left">
+            <Clock3 size={12} />
+            Local Session
+          </span>
+          <h1>Analysis History.</h1>
+          <p>Inspected payloads saved privately in your browser storage.</p>
+        </div>
+        {history.length > 0 && (
+          <button className="secondary-action" type="button" onClick={onClear}>
+            <X size={14} />
+            Clear history
+          </button>
+        )}
+      </section>
+
+      <section className="panel">
+        <div className="panel-header">
+          <h2>Saved Scans</h2>
+          <span>Local Only</span>
+        </div>
+        <div className="history-rows">
+          {history.length === 0 ? (
+            <p className="empty-copy">No scan history recorded yet.</p>
+          ) : (
+            history.map((item) => (
+              <div className="history-row" key={item.id}>
+                <span className="history-icon">
+                  {item.mode === "URL / Text" ? (
+                    <LinkIcon size={15} />
+                  ) : item.mode === "QR image" ? (
+                    <QrCode size={15} />
+                  ) : (
+                    <FileImage size={15} />
+                  )}
+                </span>
+                <div>
+                  <strong>{item.label}</strong>
+                  <span>
+                    {item.mode} · {new Date(item.createdAt).toLocaleDateString()} {new Date(item.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                  </span>
+                </div>
+                {item.risk && (
+                  <span className={`local-tag ${item.risk.toLowerCase()}`}>
+                    {item.risk}
+                  </span>
+                )}
+              </div>
+            ))
+          )}
+        </div>
+      </section>
+    </>
+  );
+}
+
+// ── View 4: Threat Intel View ─────────────────────────────────────────────────
+function ThreatIntelView() {
+  return (
+    <>
+      <section className="view-heading">
+        <div>
+          <span className="eyebrow left">
+            <ShieldAlert size={12} />
+            Reference Panel
+          </span>
+          <h1>Threat Intelligence.</h1>
+          <p>Key social-engineering indicators and attack vectors evaluated by Gemma 4.</p>
+        </div>
+      </section>
+
+      <section className="intel-grid">
+        <article className="intel-card">
+          <ShieldAlert size={20} />
+          <h2>Credential Harvesting</h2>
+          <p>
+            Lookalike sign-in pages, typosquatted domains, and urgent alerts designed to trick victims into entering passwords, PINs, or 2FA codes.
+          </p>
+        </article>
+
+        <article className="intel-card">
+          <ShieldAlert size={20} />
+          <h2>QR Phishing ("Quishing")</h2>
+          <p>
+            Malicious QR codes deployed in physical locations or PDF invoices that shift navigation from secured corporate desktops to unfiltered mobile phones.
+          </p>
+        </article>
+
+        <article className="intel-card">
+          <ShieldAlert size={20} />
+          <h2>Urgency &amp; Impersonation</h2>
+          <p>
+            Coercive claims regarding account suspension, fake KYC compliance, or overdue package fees intended to provoke hasty, unverified decisions.
+          </p>
+        </article>
+      </section>
+    </>
+  );
+}
+
+// ── View 5: Preferences View ──────────────────────────────────────────────────
+function PreferencesView({
+  compact,
+  saveLocalHistory,
+  onToggleCompact,
+  onToggleSaveHistory,
+}: {
+  compact: boolean;
+  saveLocalHistory: boolean;
+  onToggleCompact: (v: boolean) => void;
+  onToggleSaveHistory: (v: boolean) => void;
+}) {
+  return (
+    <>
+      <section className="view-heading">
+        <div>
+          <span className="eyebrow left">
+            <SlidersHorizontal size={12} />
+            Workspace Settings
+          </span>
+          <h1>Preferences.</h1>
+          <p>Configure local display and history preferences for this browser.</p>
+        </div>
+      </section>
+
+      <section className="panel preference-panel">
+        <label className="preference">
+          <span>
+            <strong>Compact layout mode</strong>
+            <small>Adjust padding and spacing in analysis panels.</small>
+          </span>
+          <input
+            type="checkbox"
+            checked={compact}
+            onChange={(e) => onToggleCompact(e.target.checked)}
+          />
+        </label>
+
+        <label className="preference">
+          <span>
+            <strong>Store local scan history</strong>
+            <small>Keep an encrypted-at-rest session record in browser localStorage.</small>
+          </span>
+          <input
+            type="checkbox"
+            checked={saveLocalHistory}
+            onChange={(e) => onToggleSaveHistory(e.target.checked)}
+          />
+        </label>
+      </section>
+    </>
   );
 }

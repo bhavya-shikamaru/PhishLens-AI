@@ -1,8 +1,8 @@
 // PhishLens AI — synthetic phishing test suite
 // Run: node --test phishing.test.js
 
-const test = require("node:test");
-const assert = require("node:assert/strict");
+import test from "node:test";
+import assert from "node:assert/strict";
 
 const TEST_CASES = [
   {
@@ -488,8 +488,8 @@ test(
   }
 );
 
-module.exports = {
+export {
   TEST_CASES,
   calculateMetrics,
   validatePrediction,
-};
+};
