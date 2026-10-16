@@ -243,16 +243,24 @@ export default function App() {
         signal: controller.signal,
       });
 
-      const data: unknown = await res.json();
+      const text = await res.text();
+      let data: unknown = null;
+      try {
+        data = text ? JSON.parse(text) : null;
+      } catch {
+        // Body was empty or not JSON (e.g. proxy reset or HTML error)
+      }
+
       if (!res.ok) {
-        const msg = typeof data === "object" && data !== null && "error" in data
-          ? String((data as Record<string, unknown>).error)
-          : "Analysis request failed.";
+        const msg =
+          typeof data === "object" && data !== null && "error" in data
+            ? String((data as Record<string, unknown>).error)
+            : `Analysis service returned HTTP ${res.status}. Please try again.`;
         throw new Error(msg);
       }
 
-      if (!isAssessment(data)) {
-        throw new Error("Received an unexpected response shape from the server.");
+      if (!data || !isAssessment(data)) {
+        throw new Error("The server returned an empty or invalid assessment format. Please try again.");
       }
 
       setAssessment(data);
@@ -299,15 +307,23 @@ export default function App() {
         signal: controller.signal,
       });
 
-      const data: unknown = await res.json();
+      const text = await res.text();
+      let data: unknown = null;
+      try {
+        data = text ? JSON.parse(text) : null;
+      } catch {
+        // Body was empty or not JSON
+      }
+
       if (!res.ok) {
-        const msg = typeof data === "object" && data !== null && "error" in data
-          ? String((data as Record<string, unknown>).error)
-          : "Image analysis failed.";
+        const msg =
+          typeof data === "object" && data !== null && "error" in data
+            ? String((data as Record<string, unknown>).error)
+            : `Image analysis failed (HTTP ${res.status}). Please try again.`;
         throw new Error(msg);
       }
 
-      if (!isAssessment(data)) {
+      if (!data || !isAssessment(data)) {
         throw new Error("Received an unexpected response format from the server.");
       }
 
