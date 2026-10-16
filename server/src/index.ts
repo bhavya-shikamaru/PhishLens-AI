@@ -15,6 +15,16 @@ app.get("/api/health", (_req, res) => res.json({ ok: true, service: "phishlens-a
 app.use("/api/analyze", analyzeRouter);
 app.use("/api/analyze/image", analyzeImageRouter);
 
+// JSON parse error handler — must be 4-arg to be recognised by Express as an error handler.
+// Catches body-parser SyntaxErrors and returns clean JSON instead of the default HTML page
+// (which would leak the full Node.js stack trace and file-system path).
+app.use((err: unknown, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (err instanceof SyntaxError && "body" in err) {
+    return res.status(400).json({ error: "Request body contains invalid JSON." });
+  }
+  next(err);
+});
+
 app.use((_req, res) => res.status(404).json({ error: "Endpoint not found." }));
 
 app.listen(port, () => {
