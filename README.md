@@ -1,6 +1,6 @@
 # PhishLens AI — Hack Day MVP scaffold
 
-PhishLens AI inspects a URL or text decoded from a QR code and provides a cautious, explainable preliminary risk assessment using Gemma 4.
+PhishLens AI inspects a URL or text decoded from a QR code and provides a cautious, explainable preliminary risk assessment using Gemma 4 through gemini api.
 
 ## Design principles
 - QR decoding happens locally in the browser with `jsQR`; the QR image is not uploaded to the backend.
