@@ -27,6 +27,9 @@ import {
   LoaderCircle,
   AlertTriangle,
   CheckCircle2,
+  Code2,
+  Copy,
+  Check,
 } from "lucide-react";
 import type { Assessment, Risk } from "./types";
 import { isAssessment } from "./types";
@@ -79,6 +82,7 @@ export default function App() {
   // Preference states
   const [compact, setCompact] = useState(false);
   const [saveLocalHistory, setSaveLocalHistory] = useState(true);
+  const [showApiModal, setShowApiModal] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -408,6 +412,14 @@ export default function App() {
           </div>
 
           <div className="top-actions">
+            <button
+              className="get-api-btn"
+              type="button"
+              onClick={() => setShowApiModal(true)}
+            >
+              <Code2 size={14} />
+              <span>Get API</span>
+            </button>
             <button className="icon-button" type="button" aria-label="Notifications">
               <Bell size={15} />
             </button>
@@ -482,6 +494,8 @@ export default function App() {
           )}
         </div>
       </main>
+
+      {showApiModal && <ApiModal onClose={() => setShowApiModal(false)} />}
     </div>
   );
 }
@@ -1062,5 +1076,143 @@ function PreferencesView({
         </label>
       </section>
     </>
+  );
+}
+
+// ── ApiModal Component ────────────────────────────────────────────────────────
+function ApiModal({ onClose }: { onClose: () => void }) {
+  const [activeTab, setActiveTab] = useState<"text" | "image" | "javascript" | "python">("text");
+  const [copied, setCopied] = useState(false);
+
+  const baseUrl = typeof window !== "undefined" ? window.location.origin : "http://localhost:3001";
+  const apiEndpoint = baseUrl.includes("5173") ? "http://localhost:3001" : baseUrl;
+
+  const snippets: Record<typeof activeTab, string> = {
+    text: `curl -X POST "${apiEndpoint}/api/analyze" \\
+  -H "Content-Type: application/json" \\
+  -d '{"payload": "https://secure-login-verify.com/account"}'`,
+    image: `curl -X POST "${apiEndpoint}/api/analyze/image" \\
+  -F "image=@suspicious_message.png"`,
+    javascript: `const response = await fetch("${apiEndpoint}/api/analyze", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    payload: "https://secure-login-verify.com/account"
+  })
+});
+const result = await response.json();
+console.log("Assessed risk:", result.risk);
+console.log("Evidence:", result.evidence);`,
+    python: `import requests
+
+res = requests.post(
+    "${apiEndpoint}/api/analyze",
+    json={"payload": "https://secure-login-verify.com/account"}
+)
+data = res.json()
+print("Risk:", data["risk"])
+print("Evidence:", data["evidence"])`,
+  };
+
+  function copySnippet() {
+    void navigator.clipboard.writeText(snippets[activeTab]);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  }
+
+  return (
+    <div
+      className="modal-backdrop"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="api-modal-title"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div className="modal-dialog">
+        <div className="modal-header">
+          <h2 id="api-modal-title">
+            <Code2 size={18} style={{ color: "var(--accent)" }} />
+            PhishLens AI — Developer API Access
+          </h2>
+          <button
+            className="modal-close-btn"
+            type="button"
+            aria-label="Close API modal"
+            onClick={onClose}
+          >
+            <X size={16} />
+          </button>
+        </div>
+
+        <div className="modal-body">
+          <p style={{ margin: 0, color: "var(--text-2)", fontSize: 13, lineHeight: 1.5 }}>
+            Integrate automated pre-click phishing analysis into your pipelines, chatbots, browser tools, or SIEM workflows.
+          </p>
+
+          <div className="modal-tabs">
+            <button
+              className={activeTab === "text" ? "active" : ""}
+              type="button"
+              onClick={() => setActiveTab("text")}
+            >
+              cURL (Text/URL)
+            </button>
+            <button
+              className={activeTab === "image" ? "active" : ""}
+              type="button"
+              onClick={() => setActiveTab("image")}
+            >
+              cURL (Screenshot)
+            </button>
+            <button
+              className={activeTab === "javascript" ? "active" : ""}
+              type="button"
+              onClick={() => setActiveTab("javascript")}
+            >
+              JavaScript
+            </button>
+            <button
+              className={activeTab === "python" ? "active" : ""}
+              type="button"
+              onClick={() => setActiveTab("python")}
+            >
+              Python
+            </button>
+          </div>
+
+          <div className="code-box">
+            <div className="code-box-header">
+              <span>{activeTab.toUpperCase()} REQUEST</span>
+              <button
+                className="copy-code-btn"
+                type="button"
+                onClick={copySnippet}
+              >
+                {copied ? <Check size={12} /> : <Copy size={12} />}
+                <span>{copied ? "Copied!" : "Copy"}</span>
+              </button>
+            </div>
+            <pre>{snippets[activeTab]}</pre>
+          </div>
+
+          <div className="api-meta-list">
+            <div className="api-meta-item">
+              <strong>Guaranteed 7-Field Response</strong>
+              <span>
+                Every request returns <code>risk</code> (<code>LOW</code>, <code>MEDIUM</code>, <code>HIGH</code>, <code>UNKNOWN</code>), <code>payloadType</code>, <code>evidence</code>, <code>deterministicObservations</code>, <code>uncertainty</code>, <code>recommendedAction</code>, and <code>disclaimer</code>.
+              </span>
+            </div>
+            <div className="api-meta-item">
+              <strong>Zero-Detonation Safety</strong>
+              <span>
+                URLs are parsed structurally and passed to Gemma 4 without navigation or DNS connection. Screenshots are processed in RAM only (max 2 MB).
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
