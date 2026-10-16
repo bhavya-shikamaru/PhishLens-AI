@@ -13,16 +13,18 @@ import {
   RotateCcw,
   RefreshCw,
   Info,
+  Camera,
 } from "lucide-react";
 import type { Assessment } from "./types";
 import { isAssessment } from "./types";
 
-type Mode = "url" | "qr";
+type Mode = "url" | "qr" | "screenshot";
 type DecodeState = "idle" | "decoding" | "done" | "error";
 
 /** Max payload length — mirrors server-side Zod schema. */
 const MAX_PAYLOAD = 4096;
-const MAX_FILE_BYTES = 5 * 1024 * 1024; // 5 MB
+const MAX_FILE_BYTES = 5 * 1024 * 1024; // 5 MB (QR decode)
+const MAX_SCREENSHOT_BYTES = 2 * 1024 * 1024; // 2 MB (server limit for screenshots)
 const MAX_PIXELS = 16_000_000; // 16 MP
 const ACCEPTED_TYPES = ["image/png", "image/jpeg", "image/webp"];
 
@@ -35,7 +37,11 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [decodeState, setDecodeState] = useState<DecodeState>("idle");
   const [dragOver, setDragOver] = useState(false);
+  // Screenshot state
+  const [screenshotFile, setScreenshotFile] = useState<File | null>(null);
+  const [screenshotName, setScreenshotName] = useState("");
   const fileInput = useRef<HTMLInputElement>(null);
+  const screenshotInput = useRef<HTMLInputElement>(null);
   // AbortController ref lets us cancel an in-flight request on Reset.
   const abortRef = useRef<AbortController | null>(null);
 
@@ -204,6 +210,73 @@ export default function App() {
     }
   }
 
+  // ── Submit screenshot to image analysis endpoint ──────────────────────
+  async function analyzeScreenshot() {
+    setError("");
+    setAssessment(null);
+
+    if (!screenshotFile) {
+      setError("Select a screenshot image first.");
+      return;
+    }
+    if (screenshotFile.size > MAX_SCREENSHOT_BYTES) {
+      setError("Screenshot must be 2 MB or smaller.");
+      return;
+    }
+    if (!ACCEPTED_TYPES.includes(screenshotFile.type)) {
+      setError("Choose a PNG, JPEG, or WebP screenshot.");
+      return;
+    }
+    if (busy) return;
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setBusy(true);
+
+    try {
+      // Image is sent as multipart FormData — the server receives raw bytes.
+      // The API key is never exposed to the client.
+      const form = new FormData();
+      form.append("image", screenshotFile);
+
+      const response = await fetch("/api/analyze/image", {
+        method: "POST",
+        body: form,
+        signal: controller.signal,
+        // Do NOT set Content-Type — browser sets it with the correct boundary.
+      });
+
+      const body: unknown = await response.json();
+
+      if (!response.ok) {
+        const message =
+          typeof body === "object" && body !== null && "error" in body
+            ? String((body as Record<string, unknown>).error)
+            : "Image analysis failed. Please try again.";
+        throw new Error(message);
+      }
+
+      if (!isAssessment(body)) {
+        throw new Error(
+          "The server returned an unexpected response format. Please try again."
+        );
+      }
+
+      setAssessment(body);
+    } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") return;
+      setError(
+        e instanceof Error
+          ? e.message
+          : "Could not connect to the analysis server. Check your connection and try again."
+      );
+    } finally {
+      abortRef.current = null;
+      setBusy(false);
+    }
+  }
+
+
   // ── Reset — also cancels any in-flight request ────────────────────────────
   function reset() {
     abortRef.current?.abort();
@@ -215,7 +288,10 @@ export default function App() {
     setBusy(false);
     setDecodeState("idle");
     setDragOver(false);
+    setScreenshotFile(null);
+    setScreenshotName("");
     if (fileInput.current) fileInput.current.value = "";
+    if (screenshotInput.current) screenshotInput.current.value = "";
   }
 
   const riskClass = assessment?.risk.toLowerCase() ?? "";
@@ -275,10 +351,20 @@ export default function App() {
             >
               <ScanLine size={16} /> QR Image
             </button>
+            <button
+              className={mode === "screenshot" ? "tab active" : "tab"}
+              onClick={() => { setMode("screenshot"); setError(""); }}
+              role="tab"
+              aria-selected={mode === "screenshot"}
+              id="tab-screenshot"
+              aria-controls="panel-screenshot"
+            >
+              <Camera size={16} /> Screenshot
+            </button>
           </div>
 
-          {/* ── URL / text mode ─────────────────────────────────────────── */}
-          {mode === "url" ? (
+          {/* ── URL / text mode ──────────────────────────────────────────── */}
+          {mode === "url" && (
             <label className="field-label" id="panel-url">
               URL or text payload
               <textarea
@@ -295,20 +381,17 @@ export default function App() {
                 spellCheck={false}
               />
             </label>
-          ) : (
-            /* ── QR image mode ────────────────────────────────────────── */
+          )}
+          {/* ── QR image mode ───────────────────────────────────────────── */}
+          {mode === "qr" && (
             <div
               id="panel-qr"
               className={`upload-zone${dragOver ? " drag-over" : ""}${decodeState === "decoding" ? " decoding" : ""}`}
-              // Drag-and-drop: events are wired here; the hidden <input> handles
-              // picker-selection only. No object URLs are created.
               onDragOver={handleDragOver}
               onDragLeave={handleDragLeave}
               onDrop={handleDrop}
               aria-label="QR image drop zone"
             >
-              {/* Hidden input for file-picker — pointer-events:none keeps it
-                  from intercepting drags, which are handled on the parent div */}
               <input
                 ref={fileInput}
                 type="file"
@@ -317,16 +400,13 @@ export default function App() {
                 onChange={(e) => void decodeFile(e.target.files?.[0])}
                 tabIndex={-1}
               />
-
               {decodeState === "decoding" ? (
-                /* ── Decoding in progress ──────────────────────────── */
                 <>
                   <LoaderCircle className="spin" size={28} style={{ color: "var(--green)" }} />
                   <strong>Decoding image locally…</strong>
                   <span>Your image never leaves your browser.</span>
                 </>
               ) : (
-                /* ── Idle / waiting for file ───────────────────────── */
                 <>
                   <div className="upload-icon"><Upload size={22} /></div>
                   <strong>{fileName || (dragOver ? "Drop to decode" : "Choose or drop a QR image")}</strong>
@@ -343,6 +423,40 @@ export default function App() {
                   </p>
                 </>
               )}
+            </div>
+          )}
+
+          {/* ── Screenshot mode ──────────────────────────────────────────── */}
+          {mode === "screenshot" && (
+            <div id="panel-screenshot" className="upload-zone">
+              <input
+                ref={screenshotInput}
+                type="file"
+                accept="image/png,image/jpeg,image/webp"
+                aria-label="Upload screenshot image"
+                style={{ position: "absolute", inset: 0, width: "100%", height: "100%", opacity: 0, pointerEvents: "none" }}
+                onChange={(e) => {
+                  const f = e.target.files?.[0] ?? null;
+                  setScreenshotFile(f);
+                  setScreenshotName(f?.name ?? "");
+                  setAssessment(null);
+                  setError("");
+                }}
+                tabIndex={-1}
+              />
+              <div className="upload-icon"><Camera size={22} /></div>
+              <strong>{screenshotName || "Choose a screenshot image"}</strong>
+              <span>PNG, JPEG or WebP · up to 2 MB · sent to AI for analysis</span>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => screenshotInput.current?.click()}
+              >
+                <Upload size={15} /> Select screenshot
+              </button>
+              <p className="local-note">
+                <Info size={13} /> The image is sent to the server for AI analysis only. The API key stays server-side.
+              </p>
             </div>
           )}
 
@@ -368,7 +482,10 @@ export default function App() {
           )}
 
           <div className="input-meta">
-            <span>{payload.length}/{MAX_PAYLOAD.toLocaleString()} characters</span>
+            {mode === "screenshot"
+              ? <span>{screenshotName ? `Selected: ${screenshotName}` : "No file selected"}</span>
+              : <span>{payload.length}/{MAX_PAYLOAD.toLocaleString()} characters</span>
+            }
             <button className="text-button" onClick={reset} aria-label="Reset form">
               <RotateCcw size={13} /> Reset
             </button>
@@ -379,11 +496,11 @@ export default function App() {
             <div className="error-message" role="alert" aria-live="assertive">
               <AlertTriangle size={16} />
               <span className="error-text">{error}</span>
-              {/* Show retry only when there is an analysable payload */}
-              {payload.trim() && !busy && (
+              {/* Retry: use the right handler for the active mode */}
+              {(mode !== "screenshot" ? payload.trim() : !!screenshotFile) && !busy && (
                 <button
                   className="text-button retry-button"
-                  onClick={() => void analyze()}
+                  onClick={() => mode === "screenshot" ? void analyzeScreenshot() : void analyze()}
                   aria-label="Retry analysis"
                 >
                   <RefreshCw size={12} /> Try again
@@ -395,8 +512,8 @@ export default function App() {
           <button
             id="analyze-button"
             className="primary-button"
-            onClick={() => void analyze()}
-            disabled={busy || !payload.trim()}
+            onClick={() => mode === "screenshot" ? void analyzeScreenshot() : void analyze()}
+            disabled={busy || (mode === "screenshot" ? !screenshotFile : !payload.trim())}
             aria-busy={busy}
           >
             {busy
