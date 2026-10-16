@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { z } from "zod";
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 import { inspectPayload } from "../lib/urlIndicators.js";
 
 export const analyzeRouter = Router();
@@ -56,7 +56,7 @@ LOCAL OBSERVATIONS (may be incomplete): ${JSON.stringify(local.observations)}`;
     const response = await ai.models.generateContent({
       model,
       contents: prompt,
-      config: { maxOutputTokens: 650, thinkingConfig: { thinkingLevel: "minimal" } },
+      config: { maxOutputTokens: 650, thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL } },
     });
     const raw = response.text ?? "";
     const result = parseJsonObject(raw);
